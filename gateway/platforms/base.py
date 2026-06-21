@@ -1696,6 +1696,8 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # Bridge for context token data from message handler to typing task.
+        self._context_info: Dict[str, Dict[str, Any]] = {}
         # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
         # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
         # Per-chat overrides live in two sets populated from ``_voice_mode``:
@@ -2741,6 +2743,14 @@ class BasePlatformAdapter(ABC):
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
         try:
             while True:
+                # Read context info for context-aware typing
+                context = self._context_info.get(chat_id, {})
+                last_prompt_tokens = context.get("last_prompt_tokens", 0)
+                context_length = context.get("context_length")
+                context_pct = None
+                if last_prompt_tokens and context_length:
+                    context_pct = last_prompt_tokens / context_length * 100
+                
                 if stop_event is not None and stop_event.is_set():
                     return
                 if chat_id not in self._typing_paused:
@@ -3733,6 +3743,14 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+
+            # Extract context info from agent result for typing indicator
+            if isinstance(response, dict):
+                chat_id = event.source.chat_id
+                self._context_info[chat_id] = {
+                    "last_prompt_tokens": response.get("last_prompt_tokens", 0) or 0,
+                    "context_length": response.get("context_length") or None,
+                }
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
