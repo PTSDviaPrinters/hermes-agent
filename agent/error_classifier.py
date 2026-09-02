@@ -193,6 +193,9 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = [
     "tool message content must be a string",
     "tool content must be a string",
     "tool message must be a string",
+    # DeepSeek: {"message": "Images are supported in user messages only:
+    # images in 'tool' messages return a 400 error"} — vision-deepseek report
+    "images in 'tool' messages return a 400 error",
     # OpenAI-compat servers that reject list-type tool content with a
     # schema-validation message
     "expected string, got list",
