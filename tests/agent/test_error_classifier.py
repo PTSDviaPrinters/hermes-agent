@@ -1533,6 +1533,28 @@ class TestMultimodalToolContentUnsupported:
         result = classify_api_error(e, provider="custom", model="some-model")
         assert result.reason == FailoverReason.multimodal_tool_content_unsupported
 
+    def test_deepseek_tool_images_pattern(self):
+        """DeepSeek's 400 wording: images are only allowed in user messages,
+        so image-bearing tool/reducer messages must be stripped and retried
+        instead of being classified as a generic bad request."""
+        e = MockAPIError(
+            "Error code: 400 - Images are supported in user messages only: images in 'tool' messages return a 400 error",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="deepseek", model="deepseek-v4-flash-0731")
+        assert result.reason == FailoverReason.multimodal_tool_content_unsupported
+        assert result.retryable is True
+
+    def test_deepseek_tool_images_pattern_from_message_text(self):
+        """Same wording classified when there is no status code to work from."""
+        e = MockAPIError(
+            "Images are supported in user messages only: images in 'tool' messages return a 400 error",
+            status_code=None,
+        )
+        result = classify_api_error(e, provider="deepseek", model="deepseek-v4-flash-0731")
+        assert result.reason == FailoverReason.multimodal_tool_content_unsupported
+        assert result.retryable is True
+
     def test_expected_string_got_list(self):
         e = MockAPIError(
             "Schema validation failed: expected string, got list",
