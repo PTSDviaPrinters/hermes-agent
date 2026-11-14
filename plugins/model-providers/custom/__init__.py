@@ -30,21 +30,12 @@ class CustomProfile(ProviderProfile):
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
 
-        # Thinking toggle.  Backends differ here: Ollama reads a top-level
-        # ``think`` boolean, while vLLM / llama.cpp servers read the chat
-        # template variable (``chat_template_kwargs.thinking``).  Send both so
-        # either kind of endpoint honors the request; compliant
-        # OpenAI-compatible servers ignore unknown body fields.
-        #
-        # These local endpoints expose thinking as on/off only — there is no
-        # graded token budget — so both "none" and "low" disable it.
-        # medium/high/xhigh leave the server default in place.
+        # Disable thinking when reasoning is turned off
         if reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
-            if _enabled is False or _effort in {"none", "low"}:
+            if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
-                extra_body["chat_template_kwargs"] = {"thinking": False}
 
         return extra_body, {}
 
