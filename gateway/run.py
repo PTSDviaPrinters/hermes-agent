@@ -2430,6 +2430,15 @@ class GatewayRunner:
 
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        # Per-channel model pin (config.yaml ``<platform>.channel_models``) acts
+        # as a persistent override that survives restarts and ``/new``.  An
+        # explicit ``/model`` in the channel still wins, since that lands in
+        # ``_session_model_overrides`` and is checked first.
+        channel_pin = None
+        if not override:
+            channel_pin = self._channel_model_override(source)
+            if channel_pin:
+                override = channel_pin
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -2470,6 +2479,21 @@ class GatewayRunner:
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
+            )
+
+        # Channel pin that carried no api_key never reaches the fast path above
+        # (``_apply_session_model_override`` only reads session overrides), so
+        # apply model/provider/base_url directly here.
+        if channel_pin and not self._session_model_overrides.get(resolved_session_key):
+            model = channel_pin.get("model") or model
+            for _key in ("provider", "base_url", "api_mode"):
+                if channel_pin.get(_key):
+                    runtime_kwargs[_key] = channel_pin[_key]
+            logger.info(
+                "Channel model pin applied: chat=%s model=%s provider=%s",
+                getattr(source, "chat_id", ""),
+                model,
+                runtime_kwargs.get("provider"),
             )
 
         # When the config has no model.default but a provider was resolved
@@ -2934,7 +2958,13 @@ class GatewayRunner:
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session overrides.
+
+        Precedence: explicit per-session override (``/reasoning``) > per-channel
+        config (``slack.channel_reasoning``) > global ``agent.reasoning_effort``.
+        The channel layer is read from config.yaml on every call, so it survives
+        gateway restarts and ``/new`` without needing a slash command.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -2945,7 +2975,128 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        channel_reasoning = self._channel_reasoning_for(source)
+        if channel_reasoning is not None:
+            return channel_reasoning
         return self._load_reasoning_config()
+
+    def _channel_config_section(self, source: Optional["SessionSource"]) -> dict:
+        """Return the config.yaml platform block for a source (e.g. ``slack:``)."""
+        if source is None:
+            return {}
+        try:
+            cfg = _load_gateway_config()
+            section = cfg_get(cfg, _platform_config_key(source.platform), default={})
+        except Exception:
+            return {}
+        return section if isinstance(section, dict) else {}
+
+    def _channel_config_entry(self, source: Optional["SessionSource"], key: str):
+        """Look up a per-channel override by chat id.
+
+        Slack thread ids arrive as ``<channel>:<thread_ts>`` in some paths, so
+        fall back to the parent channel id when the exact key misses.
+        """
+        section = self._channel_config_section(source)
+        mapping = section.get(key)
+        if not isinstance(mapping, dict):
+            return None
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return None
+        entry = mapping.get(chat_id)
+        if entry is None and ":" in chat_id:
+            entry = mapping.get(chat_id.split(":", 1)[0])
+        return entry
+
+    def _channel_reasoning_for(self, source: Optional["SessionSource"]) -> dict | None:
+        """Per-channel reasoning effort from config (``<platform>.channel_reasoning``).
+
+        Accepts either a bare level string or a mapping with ``effort``/``level``.
+        """
+        entry = self._channel_config_entry(source, "channel_reasoning")
+        if entry is None:
+            return None
+        if isinstance(entry, dict):
+            raw = str(entry.get("effort") or entry.get("level") or "").strip()
+        else:
+            raw = str(entry).strip()
+        if not raw:
+            return None
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(raw)
+        if parsed is None:
+            logger.warning(
+                "Unknown channel_reasoning value %r for chat %s — using global effort",
+                raw,
+                getattr(source, "chat_id", ""),
+            )
+        return parsed
+
+    def _channel_model_override(self, source: Optional["SessionSource"]) -> dict | None:
+        """Per-channel model/provider pin from config (``<platform>.channel_models``).
+
+        Returns a session-override-shaped dict (model/provider/api_key/base_url/
+        api_mode) resolved through the same pipeline ``/model`` uses, or None.
+        """
+        entry = self._channel_config_entry(source, "channel_models")
+        if not isinstance(entry, dict):
+            return None
+        model = str(entry.get("model") or "").strip()
+        provider = str(entry.get("provider") or "").strip()
+        if not model and not provider:
+            return None
+        cfg = _load_gateway_config()
+        # User-defined endpoints (``providers:`` in config.yaml) resolve
+        # directly — switch_model() does not know these slugs and would fall
+        # back to OpenRouter's base URL.
+        provs = cfg.get("providers")
+        if isinstance(provs, dict) and provider:
+            endpoint = provs.get(provider)
+            if isinstance(endpoint, dict):
+                base_url = str(
+                    endpoint.get("api") or endpoint.get("base_url") or ""
+                ).strip()
+                if base_url:
+                    return {
+                        "model": model
+                        or str(endpoint.get("default_model") or endpoint.get("model") or ""),
+                        "provider": provider,
+                        "api_key": str(endpoint.get("api_key") or ""),
+                        "base_url": base_url,
+                        "api_mode": str(endpoint.get("transport") or "chat_completions"),
+                    }
+        try:
+            from hermes_cli.model_switch import switch_model
+            from hermes_cli.config import get_compatible_custom_providers
+
+            model_cfg = cfg.get("model") or {}
+            result = switch_model(
+                model,
+                current_provider=str(model_cfg.get("provider") or ""),
+                current_model=str(model_cfg.get("default") or ""),
+                current_base_url=str(model_cfg.get("base_url") or ""),
+                current_api_key="",
+                is_global=False,
+                explicit_provider=provider,
+                user_providers=provs or {},
+                custom_providers=get_compatible_custom_providers(cfg),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Channel model pin failed for chat %s: %s",
+                getattr(source, "chat_id", ""),
+                exc,
+            )
+            return None
+        return {
+            "model": result.new_model or model,
+            "provider": result.target_provider or provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
 
     def _set_session_reasoning_override(
         self,
